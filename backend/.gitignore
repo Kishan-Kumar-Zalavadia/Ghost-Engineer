@@ -1,0 +1,4 @@
+# Google Cloud credentials - NEVER commit this
+google-credentials.json
+*.json key
+service-account*.json
