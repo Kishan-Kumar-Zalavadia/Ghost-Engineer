@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     mongodb_min_pool_size: int = 2
 
     gitlab_webhook_token: str = "change-me"
+    gitlab_url: str = "https://gitlab.com"
+    gitlab_token: str = ""
+    gitlab_project_id: int = 0
 
 
 settings = Settings()
