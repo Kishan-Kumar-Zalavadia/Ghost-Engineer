@@ -18,5 +18,8 @@ class Settings(BaseSettings):
     gitlab_token: str = ""
     gitlab_project_id: int = 0
 
+    google_cloud_project: str = ""
+    vertex_ai_location: str = "us-central1"
+
 
 settings = Settings()

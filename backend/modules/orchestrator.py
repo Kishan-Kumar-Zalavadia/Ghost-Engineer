@@ -16,7 +16,7 @@ import gitlab as gitlab_lib
 
 from backend import database
 from backend.config import settings
-from backend.modules import developer_profiler, gitlab_reader, pattern_detector
+from backend.modules import developer_profiler, ghost_brain, gitlab_reader, pattern_detector
 
 logger = logging.getLogger(__name__)
 
@@ -263,13 +263,24 @@ async def process_new_commit(webhook_payload: dict) -> dict:
 
         # Step 6 – ghost response trigger
         ghost_triggered = False
+        ghost_comment_text: str = ""
         if risk_score > 3:
             ghost_triggered = True
             logger.info(
-                "[orchestrator] HIGH RISK commit %s (score=%.1f) by %s – ghost response queued",
+                "[orchestrator] HIGH RISK commit %s (score=%.1f) by %s – generating ghost comment",
                 sha, risk_score, gitlab_username,
             )
-            # TODO: call ghost_responder.trigger_commit_response(sha, pattern_result, developer_context)
+            try:
+                ghost_comment_text = await ghost_brain.generate_mr_comment(
+                    findings=pattern_result.get("findings", []),
+                    developer_context=developer_context,
+                    commit_sha=sha,
+                    diff_content=diff_content,
+                    historical_patterns=[],  # populated by scheduled scan
+                )
+                logger.info("[orchestrator] ghost comment generated for commit %s", sha)
+            except Exception as exc:
+                logger.error("[orchestrator] ghost_brain failed for %s: %s", sha, exc)
 
         # Step 7 – persist enriched document
         doc = {
@@ -291,6 +302,7 @@ async def process_new_commit(webhook_payload: dict) -> dict:
             "patterns_detected": pattern_result,
             "developer_context_snapshot": developer_context,
             "ghost_triggered": ghost_triggered,
+            "ghost_comment": ghost_comment_text or None,
             "processed_at": datetime.now(timezone.utc),
         }
         try:
@@ -404,10 +416,21 @@ async def process_new_merge_request(webhook_payload: dict) -> dict:
             ],
         }
         logger.info(
-            "[orchestrator] MR!%s has %d critical/high findings – ghost comment prepared",
+            "[orchestrator] MR!%s has %d critical/high findings – generating ghost comment",
             mr_iid, len(critical_high),
         )
-        # TODO: call ghost_responder.post_mr_comment(ghost_comment)
+        try:
+            mr_comment_text = await ghost_brain.generate_mr_comment(
+                findings=critical_high,
+                developer_context=developer_context,
+                commit_sha=f"mr-{mr_iid}",
+                diff_content=diff_content,
+                historical_patterns=[],
+            )
+            ghost_comment["generated_text"] = mr_comment_text
+            logger.info("[orchestrator] ghost MR comment generated for MR!%s", mr_iid)
+        except Exception as exc:
+            logger.error("[orchestrator] ghost_brain MR comment failed for MR!%s: %s", mr_iid, exc)
 
     # Step 6 – persist MR analysis
     mrs_col = database.get_collection("merge_requests")
