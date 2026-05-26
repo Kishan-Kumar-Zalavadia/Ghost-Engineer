@@ -89,9 +89,12 @@ async def initialize_repository(project_id: int) -> dict:
 
     # Step 2 – pattern detection over every stored commit
     commits_col = database.get_collection("commits")
+    total_in_db = await commits_col.count_documents({})
+    logger.info("[orchestrator] commits in MongoDB after scan: %d", total_in_db)
+
     cursor = commits_col.find(
         {},  # initial scan; project_id may not be stored by gitlab_reader yet
-        {"commit_hash": 1, "diff": 1, "author_email": 1, "author_name": 1, "created_at": 1},
+        {"commit_hash": 1, "diff": 1, "diff_content": 1, "author_email": 1, "author_name": 1, "created_at": 1},
     )
 
     pattern_results: list[dict] = []
@@ -99,10 +102,24 @@ async def initialize_repository(project_id: int) -> dict:
 
     async for commit in cursor:
         sha: str = commit.get("commit_hash", "")
-        diff: str = commit.get("diff", "")
+
+        # gitlab_reader stores diffs as diff_content (list of dicts); flatten to string
+        raw_diff = commit.get("diff_content") or commit.get("diff") or []
+        if isinstance(raw_diff, list):
+            diff = "\n".join(
+                d.get("diff", "") for d in raw_diff if isinstance(d, dict)
+            )
+        else:
+            diff = raw_diff or ""
+
         author_email: str = commit.get("author_email", "")
         author_name: str = commit.get("author_name", "")
         timestamp: datetime = _parse_timestamp(commit.get("created_at"))
+
+        logger.info(
+            "[orchestrator] processing commit %s | author=%s | diff_chars=%d",
+            sha[:8], author_email or author_name, len(diff),
+        )
 
         try:
             result = await pattern_detector.analyze_commit(
@@ -110,6 +127,12 @@ async def initialize_repository(project_id: int) -> dict:
                 diff_content=diff,
                 author=author_email or author_name,
                 timestamp=timestamp,
+            )
+            logger.info(
+                "[orchestrator] pattern result for %s | risk_score=%s | findings=%d",
+                sha[:8],
+                result.get("risk_score"),
+                len(result.get("findings", [])),
             )
             pattern_results.append(result)
         except Exception as exc:

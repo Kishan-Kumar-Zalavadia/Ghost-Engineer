@@ -1498,7 +1498,7 @@ def main() -> None:
 
     try:
         gl.auth()
-        print(f"Authenticated as: {gl.users.get(gl.auth()).username}")
+        print(f"Authenticated as: {gl.user.username if gl.user else 'unknown'}")
     except Exception as exc:
         print(f"ERROR: Authentication failed — {exc}")
         sys.exit(1)
