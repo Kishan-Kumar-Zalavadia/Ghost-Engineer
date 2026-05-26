@@ -16,7 +16,7 @@ import gitlab as gitlab_lib
 
 from backend import database
 from backend.config import settings
-from backend.modules import developer_profiler, ghost_brain, gitlab_reader, pattern_detector
+from backend.modules import developer_profiler, ghost_actions, ghost_brain, gitlab_reader, pattern_detector
 
 logger = logging.getLogger(__name__)
 
@@ -264,23 +264,39 @@ async def process_new_commit(webhook_payload: dict) -> dict:
         # Step 6 – ghost response trigger
         ghost_triggered = False
         ghost_comment_text: str = ""
+        findings: list[dict] = pattern_result.get("findings", [])
         if risk_score > 3:
             ghost_triggered = True
             logger.info(
-                "[orchestrator] HIGH RISK commit %s (score=%.1f) by %s – generating ghost comment",
+                "[orchestrator] HIGH RISK commit %s (score=%.1f) by %s – triggering ghost actions",
                 sha, risk_score, gitlab_username,
             )
+            # Enrich developer_context with commit SHA so ghost_actions can use it
+            developer_context["last_commit_sha"] = sha
+            developer_context["gitlab_username"] = gitlab_username
             try:
-                ghost_comment_text = await ghost_brain.generate_mr_comment(
-                    findings=pattern_result.get("findings", []),
-                    developer_context=developer_context,
+                action = await ghost_actions.post_commit_comment(
+                    project_id=project_id,
                     commit_sha=sha,
-                    diff_content=diff_content,
-                    historical_patterns=[],  # populated by scheduled scan
+                    findings=findings,
+                    developer_context=developer_context,
                 )
-                logger.info("[orchestrator] ghost comment generated for commit %s", sha)
+                ghost_comment_text = action.get("comment_text", "")
             except Exception as exc:
-                logger.error("[orchestrator] ghost_brain failed for %s: %s", sha, exc)
+                logger.error("[orchestrator] ghost_actions.post_commit_comment failed for %s: %s", sha, exc)
+
+            # Create security issues for any CRITICAL findings
+            critical = [f for f in findings if f.get("severity") == "CRITICAL"]
+            for crit_finding in critical:
+                try:
+                    await ghost_actions.create_security_issue(
+                        project_id=project_id,
+                        finding=crit_finding,
+                        commit_sha=sha,
+                        developer=gitlab_username,
+                    )
+                except Exception as exc:
+                    logger.error("[orchestrator] create_security_issue failed for %s: %s", sha, exc)
 
         # Step 7 – persist enriched document
         doc = {
@@ -393,44 +409,40 @@ async def process_new_merge_request(webhook_payload: dict) -> dict:
     except Exception as exc:
         logger.error("[orchestrator] get_developer_context error for %s: %s", gitlab_username, exc)
 
-    # Step 5 – prepare ghost comment for CRITICAL / HIGH findings
+    # Step 5 – post ghost comment for CRITICAL / HIGH findings
     findings: list[dict] = pattern_result.get("findings", [])
     critical_high = [f for f in findings if f.get("severity") in ("CRITICAL", "HIGH")]
 
     ghost_comment: dict | None = None
     if critical_high:
-        ghost_comment = {
-            "mr_iid": mr_iid,
-            "project_id": project_id,
-            "findings_count": len(critical_high),
-            "response_style": developer_context.get("response_style", "educational"),
-            "findings_summary": [
-                {
-                    "detector": f.get("detector_name"),
-                    "severity": f.get("severity"),
-                    "description": f.get("description"),
-                    "suggested_fix": f.get("suggested_fix"),
-                    "line_number": f.get("line_number"),
-                }
-                for f in critical_high
-            ],
-        }
         logger.info(
-            "[orchestrator] MR!%s has %d critical/high findings – generating ghost comment",
+            "[orchestrator] MR!%s has %d critical/high findings – posting ghost comment",
             mr_iid, len(critical_high),
         )
+        developer_context["gitlab_username"] = gitlab_username
         try:
-            mr_comment_text = await ghost_brain.generate_mr_comment(
+            ghost_comment = await ghost_actions.post_mr_comment(
+                project_id=project_id,
+                mr_iid=mr_iid,
                 findings=critical_high,
                 developer_context=developer_context,
-                commit_sha=f"mr-{mr_iid}",
                 diff_content=diff_content,
-                historical_patterns=[],
             )
-            ghost_comment["generated_text"] = mr_comment_text
-            logger.info("[orchestrator] ghost MR comment generated for MR!%s", mr_iid)
         except Exception as exc:
-            logger.error("[orchestrator] ghost_brain MR comment failed for MR!%s: %s", mr_iid, exc)
+            logger.error("[orchestrator] ghost_actions.post_mr_comment failed for MR!%s: %s", mr_iid, exc)
+
+        # Create security issues for any CRITICAL findings in the MR
+        critical_only = [f for f in critical_high if f.get("severity") == "CRITICAL"]
+        for crit_finding in critical_only:
+            try:
+                await ghost_actions.create_security_issue(
+                    project_id=project_id,
+                    finding=crit_finding,
+                    commit_sha=f"mr-{mr_iid}",
+                    developer=gitlab_username,
+                )
+            except Exception as exc:
+                logger.error("[orchestrator] create_security_issue failed for MR!%s: %s", mr_iid, exc)
 
     # Step 6 – persist MR analysis
     mrs_col = database.get_collection("merge_requests")
@@ -572,36 +584,62 @@ async def run_scheduled_scan(project_id: int) -> dict:
             {"commit_hash": doc["commit_hash"], "author": doc.get("author_email")}
         )
 
-    # Step 4 – queue proactive MR generation for top 3 unflagged patterns
-    proactive_queued: int = 0
+    # Step 4 – open proactive MRs for top 3 unflagged patterns
+    # Only fire if Ghost hasn't already opened one for this pattern recently.
+    proactive_mrs_opened: list[str] = []
     for pattern in unflagged_patterns[:3]:
-        queue_doc = {
-            "project_id": project_id,
-            "action_type": "proactive_mr",
-            "pattern_name": pattern["detector_name"],
-            "occurrences": pattern["occurrences"],
-            "status": "queued",
-            "created_at": datetime.now(timezone.utc),
-        }
-        result = await ghost_actions_col.update_one(
+        detector_name = pattern["detector_name"]
+        already_opened = await ghost_actions_col.find_one(
             {
                 "project_id": project_id,
                 "action_type": "proactive_mr",
-                "pattern_name": pattern["detector_name"],
-                "status": "queued",
-            },
-            {"$setOnInsert": queue_doc},
-            upsert=True,
+                "pattern_type": detector_name,
+                "was_merged": {"$ne": True},
+            }
         )
-        if result.upserted_id:
-            proactive_queued += 1
+        if already_opened:
             logger.info(
-                "[orchestrator] queued proactive MR for pattern: %s",
-                pattern["detector_name"],
+                "[orchestrator] proactive MR already open for pattern=%s, skipping",
+                detector_name,
+            )
+            continue
+
+        # Collect the affected files from recent commits that triggered this pattern
+        affected_files: list[str] = []
+        async for doc in commits_col.find(
+            {
+                "project_id": project_id,
+                "patterns_detected.findings": {"$elemMatch": {"detector_name": detector_name}},
+            },
+            {"files_modified": 1, "files_added": 1},
+            limit=10,
+        ):
+            affected_files.extend(doc.get("files_modified", []))
+            affected_files.extend(doc.get("files_added", []))
+        # Deduplicate and cap
+        affected_files = list(dict.fromkeys(affected_files))[:10]
+
+        # Ghost opens the MR with an empty proposed_file_changes list —
+        # the description will explain the pattern and the team applies the fix.
+        # A future enhancement will auto-generate the patch using Gemini.
+        try:
+            mr_url = await ghost_actions.open_proactive_mr(
+                project_id=project_id,
+                pattern_type=detector_name,
+                affected_files=affected_files,
+                proposed_file_changes=[],   # description-only MR for now
+            )
+            proactive_mrs_opened.append(mr_url)
+            logger.info("[orchestrator] proactive MR opened: %s", mr_url)
+        except Exception as exc:
+            logger.error(
+                "[orchestrator] open_proactive_mr failed for pattern=%s: %s",
+                detector_name, exc,
             )
 
-    # Step 5 – refresh all developer profiles for this project
+    # Step 5 – refresh developer profiles and send weekly coaching reports
     profiles_updated = 0
+    coaching_reports_sent = 0
     async for profile in profiles_col.find(
         {},  # profiles are not scoped to project_id yet
         {"email": 1, "gitlab_username": 1},
@@ -610,8 +648,34 @@ async def run_scheduled_scan(project_id: int) -> dict:
         if not identifier:
             continue
         try:
-            await developer_profiler.build_developer_profile(identifier)
+            updated_profile = await developer_profiler.build_developer_profile(identifier)
             profiles_updated += 1
+
+            # Send a weekly coaching report if one hasn't been sent this week
+            username = profile.get("gitlab_username") or ""
+            if username:
+                from datetime import timedelta
+                one_week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+                recent_report = await ghost_actions_col.find_one(
+                    {
+                        "action_type": "coaching_report",
+                        "developer": username,
+                        "timestamp": {"$gte": one_week_ago},
+                    }
+                )
+                if not recent_report:
+                    try:
+                        await ghost_actions.send_weekly_coaching_report(
+                            project_id=project_id,
+                            developer_username=username,
+                            developer_profile=updated_profile,
+                        )
+                        coaching_reports_sent += 1
+                    except Exception as exc:
+                        logger.error(
+                            "[orchestrator] coaching report failed for %s: %s",
+                            username, exc,
+                        )
         except Exception as exc:
             logger.error(
                 "[orchestrator] profile refresh failed for %s: %s", identifier, exc
@@ -623,7 +687,9 @@ async def run_scheduled_scan(project_id: int) -> dict:
         "top_unflagged": unflagged_patterns[:5],
         "cve_candidates": len(cve_candidates),
         "dead_code_findings": len(dead_code_commits),
-        "proactive_mrs_queued": proactive_queued,
+        "proactive_mrs_opened": len(proactive_mrs_opened),
+        "proactive_mr_urls": proactive_mrs_opened,
         "developer_profiles_updated": profiles_updated,
+        "coaching_reports_sent": coaching_reports_sent,
         "scanned_at": datetime.now(timezone.utc).isoformat(),
     }
