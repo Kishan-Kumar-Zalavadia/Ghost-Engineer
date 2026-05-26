@@ -105,6 +105,82 @@ async def _call_gemini(prompt: str, temperature: float = 0.75) -> str:
 # Ghost system prompt
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Protected branch names — commits here get immediate Ghost responses
+# ---------------------------------------------------------------------------
+
+_PROTECTED_BRANCHES: frozenset[str] = frozenset(
+    {"main", "master", "production", "prod", "release", "hotfix"}
+)
+
+
+def calculate_response_urgency(
+    findings: list[dict],
+    branch: str,
+    developer_context: dict,
+    risk_score: float = 0.0,
+) -> str:
+    """
+    Decide how urgently Ghost should respond to a set of findings.
+
+    Decision matrix
+    ---------------
+    ``"immediate_security"``
+        Any CRITICAL finding — a confidential GitLab issue is created right now,
+        regardless of branch.
+
+    ``"immediate_comment"``
+        risk_score > 4 AND the commit is on a protected branch (main / master /
+        production / prod / release / hotfix).  Ghost comments on the commit
+        within the same webhook cycle.
+
+    ``"mr_review"``
+        Any HIGH finding, or risk_score > 2 on any branch.  Ghost waits for an
+        MR and comments there so the review has proper context.
+
+    ``"digest"``
+        Only LOW / WARNING findings.  Queued for a daily digest — no immediate
+        noise.
+
+    Parameters
+    ----------
+    findings:
+        List of Finding dicts from ``pattern_detector.analyze_commit()``.
+    branch:
+        The branch name the commit landed on (no ``refs/heads/`` prefix).
+    developer_context:
+        The context dict from ``developer_profiler.get_developer_context()``.
+        Used for future personalisation (currently informational).
+    risk_score:
+        Pre-computed risk score (0–10) from the pattern detector.
+
+    Returns
+    -------
+    str  One of ``"immediate_security"``, ``"immediate_comment"``,
+         ``"mr_review"``, or ``"digest"``.
+    """
+    if not findings:
+        return "digest"
+
+    severities = {f.get("severity", "LOW") for f in findings}
+
+    # CRITICAL always escalates immediately, regardless of branch
+    if "CRITICAL" in severities:
+        return "immediate_security"
+
+    # High risk on a protected branch — comment right away
+    is_protected = branch.lower() in _PROTECTED_BRANCHES
+    if risk_score > 4 and is_protected:
+        return "immediate_comment"
+
+    # Any HIGH finding or meaningful risk → defer to MR review thread
+    if "HIGH" in severities or risk_score > 2:
+        return "mr_review"
+
+    # Only LOW / WARNING findings — batch into daily digest
+    return "digest"
+
+
 def get_system_prompt() -> str:
     """Return Ghost's core persona and operating rules."""
     return """\

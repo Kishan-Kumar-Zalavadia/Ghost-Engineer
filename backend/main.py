@@ -7,9 +7,11 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from backend import database
+from fastapi import Request as FastAPIRequest
+
+from backend import database, pubsub as pubsub_module
 from backend.config import settings
-from backend.modules import orchestrator, proactive_ghost
+from backend.modules import developer_profiler, ghost_actions, orchestrator, proactive_ghost
 from backend.webhooks.router import router as webhooks_router
 
 
@@ -242,3 +244,112 @@ async def ghost_feedback(feedback: GhostFeedback):
         "was_helpful": feedback.was_helpful,
         "reason": feedback.reason,
     }
+
+
+@app.post("/ghost/initialize-and-scan", tags=["ghost"])
+async def initialize_and_scan(project_id: int):
+    """
+    Full pipeline trigger — runs everything Ghost can do in one shot.
+
+    Steps
+    -----
+    1. ``initialize_repository``     — fetch all commits/MRs, run pattern
+       detection, build developer profiles.
+    2. ``run_scheduled_proactive_scan`` — security quick-wins, duplicate
+       code extraction, documentation gaps.
+    3. Generate a coaching report for every developer found in step 1.
+
+    Returns a combined summary of every action taken.
+    """
+    # Step 1 — initialise repository
+    try:
+        init_result = await orchestrator.initialize_repository(project_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"initialize_repository failed: {exc}",
+        )
+
+    # Step 2 — proactive scan (bypass the 4-hour cooldown by calling directly)
+    try:
+        proactive_result = await proactive_ghost.run_scheduled_proactive_scan(project_id)
+    except Exception as exc:
+        proactive_result = {"error": str(exc)}
+
+    # Step 3 — coaching report for every developer profiled in step 1
+    profiles_col = database.get_collection("developer_profiles")
+    coaching_results: list[dict] = []
+
+    async for profile in profiles_col.find(
+        {},
+        {"email": 1, "gitlab_username": 1},
+    ):
+        username = profile.get("gitlab_username") or profile.get("email", "")
+        if not username:
+            continue
+        try:
+            full_profile = await developer_profiler.build_developer_profile(username)
+            report_action = await ghost_actions.send_weekly_coaching_report(
+                project_id=project_id,
+                developer_username=username,
+                developer_profile=full_profile,
+            )
+            coaching_results.append({
+                "developer": username,
+                "status": "sent",
+                "issue_url": report_action.get("issue_url", ""),
+            })
+        except Exception as exc:
+            coaching_results.append({"developer": username, "status": "error", "reason": str(exc)})
+
+    return {
+        "project_id": project_id,
+        "initialization": init_result,
+        "proactive_scan": proactive_result,
+        "coaching_reports": {
+            "sent": sum(1 for r in coaching_results if r["status"] == "sent"),
+            "errors": sum(1 for r in coaching_results if r["status"] == "error"),
+            "details": coaching_results,
+        },
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.post("/pubsub/receive", tags=["pubsub"])
+async def pubsub_receive(request: FastAPIRequest):
+    """
+    Google Cloud Pub/Sub push subscriber endpoint.
+
+    Pub/Sub delivers messages here via HTTP POST.  This endpoint decodes the
+    base64 message, routes it to the appropriate orchestrator function, and
+    returns 200 to acknowledge.  Returning non-200 causes Pub/Sub to retry.
+
+    Expected body (Pub/Sub push format)::
+
+        {
+          "message": {
+            "data": "<base64-encoded JSON>",
+            "messageId": "...",
+            "publishTime": "..."
+          },
+          "subscription": "projects/.../subscriptions/..."
+        }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        # Malformed body — ack to prevent infinite retry on bad messages
+        return {"status": "ack", "reason": "unparseable body"}
+
+    event = pubsub_module.decode_pubsub_message(body)
+    if event is None:
+        return {"status": "ack", "reason": "decode failed"}
+
+    try:
+        result = await pubsub_module.route_pubsub_event(event)
+        return {"status": "ack", "result": result}
+    except Exception as exc:
+        # Log but still ack — a persistent crash here would loop forever
+        import logging as _logging
+        _logging.getLogger(__name__).error("[pubsub/receive] routing error: %s", exc)
+        return {"status": "ack", "reason": f"routing error: {exc}"}

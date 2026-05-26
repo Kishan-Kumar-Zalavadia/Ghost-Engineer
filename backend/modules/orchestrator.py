@@ -9,7 +9,7 @@ run_scheduled_scan(project_id)         – called every 4 hours by Cloud Schedul
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import gitlab as gitlab_lib
@@ -24,6 +24,44 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+async def _queue_for_digest(
+    project_id: int,
+    ref: str,
+    developer: str,
+    findings: list[dict],
+) -> None:
+    """
+    Store low-priority findings in the ghost_actions collection under
+    action_type='digest_queued'.  A daily job can pick these up and
+    batch them into a single developer notification.
+    """
+    if not findings:
+        return
+    col = database.get_collection("ghost_actions")
+    await col.insert_one(
+        {
+            "action_type": "digest_queued",
+            "project_id": project_id,
+            "ref": ref,
+            "developer": developer,
+            "findings_count": len(findings),
+            "findings_summary": [
+                {
+                    "detector": f.get("detector_name"),
+                    "severity": f.get("severity"),
+                    "description": f.get("description", "")[:120],
+                }
+                for f in findings[:10]
+            ],
+            "timestamp": datetime.now(timezone.utc),
+            "was_accepted": None,
+        }
+    )
+    logger.info(
+        "[orchestrator] %d findings queued for digest | ref=%s developer=%s",
+        len(findings), ref, developer,
+    )
 
 def _gitlab_client() -> gitlab_lib.Gitlab:
     gl = gitlab_lib.Gitlab(settings.gitlab_url, private_token=settings.gitlab_token)
@@ -261,31 +299,28 @@ async def process_new_commit(webhook_payload: dict) -> dict:
         except Exception as exc:
             logger.error("[orchestrator] get_developer_context error for %s: %s", gitlab_username, exc)
 
-        # Step 6 – ghost response trigger
-        ghost_triggered = False
-        ghost_comment_text: str = ""
+        # Step 6 – ghost response routing via urgency calculation
         findings: list[dict] = pattern_result.get("findings", [])
-        if risk_score > 3:
-            ghost_triggered = True
-            logger.info(
-                "[orchestrator] HIGH RISK commit %s (score=%.1f) by %s – triggering ghost actions",
-                sha, risk_score, gitlab_username,
-            )
-            # Enrich developer_context with commit SHA so ghost_actions can use it
-            developer_context["last_commit_sha"] = sha
-            developer_context["gitlab_username"] = gitlab_username
-            try:
-                action = await ghost_actions.post_commit_comment(
-                    project_id=project_id,
-                    commit_sha=sha,
-                    findings=findings,
-                    developer_context=developer_context,
-                )
-                ghost_comment_text = action.get("comment_text", "")
-            except Exception as exc:
-                logger.error("[orchestrator] ghost_actions.post_commit_comment failed for %s: %s", sha, exc)
+        urgency = ghost_brain.calculate_response_urgency(
+            findings=findings,
+            branch=branch,
+            developer_context=developer_context,
+            risk_score=risk_score,
+        )
+        logger.info(
+            "[orchestrator] commit %s | risk=%.1f branch=%s urgency=%s findings=%d",
+            sha[:8], risk_score, branch, urgency, len(findings),
+        )
 
-            # Create security issues for any CRITICAL findings
+        ghost_triggered = urgency in ("immediate_security", "immediate_comment")
+        ghost_comment_text: str = ""
+
+        # Enrich context with identifiers the ghost_actions module needs
+        developer_context["last_commit_sha"] = sha
+        developer_context["gitlab_username"] = gitlab_username
+
+        if urgency == "immediate_security":
+            # CRITICAL: create a confidential security issue for every critical finding
             critical = [f for f in findings if f.get("severity") == "CRITICAL"]
             for crit_finding in critical:
                 try:
@@ -296,7 +331,53 @@ async def process_new_commit(webhook_payload: dict) -> dict:
                         developer=gitlab_username,
                     )
                 except Exception as exc:
-                    logger.error("[orchestrator] create_security_issue failed for %s: %s", sha, exc)
+                    logger.error(
+                        "[orchestrator] create_security_issue failed for %s: %s", sha, exc
+                    )
+            # Also post a commit comment so the developer sees it immediately
+            try:
+                action = await ghost_actions.post_commit_comment(
+                    project_id=project_id,
+                    commit_sha=sha,
+                    findings=findings,
+                    developer_context=developer_context,
+                )
+                ghost_comment_text = action.get("comment_text", "")
+            except Exception as exc:
+                logger.error(
+                    "[orchestrator] post_commit_comment failed for %s: %s", sha, exc
+                )
+
+        elif urgency == "immediate_comment":
+            # High risk on protected branch — comment on the commit directly
+            try:
+                action = await ghost_actions.post_commit_comment(
+                    project_id=project_id,
+                    commit_sha=sha,
+                    findings=findings,
+                    developer_context=developer_context,
+                )
+                ghost_comment_text = action.get("comment_text", "")
+            except Exception as exc:
+                logger.error(
+                    "[orchestrator] post_commit_comment failed for %s: %s", sha, exc
+                )
+
+        elif urgency == "mr_review":
+            # Queue for MR review — Ghost will comment when the MR is opened
+            logger.info(
+                "[orchestrator] commit %s queued for MR review (risk=%.1f)",
+                sha[:8], risk_score,
+            )
+
+        else:  # digest
+            # LOW/WARNING only — add to daily digest queue
+            await _queue_for_digest(
+                project_id=project_id,
+                ref=f"commit:{sha[:8]}",
+                developer=gitlab_username,
+                findings=findings,
+            )
 
         # Step 7 – persist enriched document
         doc = {
@@ -409,17 +490,30 @@ async def process_new_merge_request(webhook_payload: dict) -> dict:
     except Exception as exc:
         logger.error("[orchestrator] get_developer_context error for %s: %s", gitlab_username, exc)
 
-    # Step 5 – post ghost comment for CRITICAL / HIGH findings
+    # Step 5 – route MR findings by urgency
     findings: list[dict] = pattern_result.get("findings", [])
-    critical_high = [f for f in findings if f.get("severity") in ("CRITICAL", "HIGH")]
+    risk_score_mr: float = pattern_result.get("risk_score", 0)
+    mr_urgency = ghost_brain.calculate_response_urgency(
+        findings=findings,
+        branch=source_branch,
+        developer_context=developer_context,
+        risk_score=risk_score_mr,
+    )
+    logger.info(
+        "[orchestrator] MR!%s | risk=%.1f urgency=%s findings=%d",
+        mr_iid, risk_score_mr, mr_urgency, len(findings),
+    )
 
+    critical_high = [f for f in findings if f.get("severity") in ("CRITICAL", "HIGH")]
     ghost_comment: dict | None = None
-    if critical_high:
+    developer_context["gitlab_username"] = gitlab_username
+
+    if mr_urgency in ("immediate_security", "immediate_comment", "mr_review") and critical_high:
+        # HIGH or CRITICAL findings → post a comment on the MR
         logger.info(
             "[orchestrator] MR!%s has %d critical/high findings – posting ghost comment",
             mr_iid, len(critical_high),
         )
-        developer_context["gitlab_username"] = gitlab_username
         try:
             ghost_comment = await ghost_actions.post_mr_comment(
                 project_id=project_id,
@@ -429,20 +523,36 @@ async def process_new_merge_request(webhook_payload: dict) -> dict:
                 diff_content=diff_content,
             )
         except Exception as exc:
-            logger.error("[orchestrator] ghost_actions.post_mr_comment failed for MR!%s: %s", mr_iid, exc)
+            logger.error(
+                "[orchestrator] ghost_actions.post_mr_comment failed for MR!%s: %s",
+                mr_iid, exc,
+            )
 
-        # Create security issues for any CRITICAL findings in the MR
-        critical_only = [f for f in critical_high if f.get("severity") == "CRITICAL"]
-        for crit_finding in critical_only:
-            try:
-                await ghost_actions.create_security_issue(
-                    project_id=project_id,
-                    finding=crit_finding,
-                    commit_sha=f"mr-{mr_iid}",
-                    developer=gitlab_username,
-                )
-            except Exception as exc:
-                logger.error("[orchestrator] create_security_issue failed for MR!%s: %s", mr_iid, exc)
+        # Create a confidential security issue for every CRITICAL finding
+        if mr_urgency == "immediate_security":
+            critical_only = [f for f in critical_high if f.get("severity") == "CRITICAL"]
+            for crit_finding in critical_only:
+                try:
+                    await ghost_actions.create_security_issue(
+                        project_id=project_id,
+                        finding=crit_finding,
+                        commit_sha=f"mr-{mr_iid}",
+                        developer=gitlab_username,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "[orchestrator] create_security_issue failed for MR!%s: %s",
+                        mr_iid, exc,
+                    )
+
+    else:
+        # Only LOW / WARNING findings — add to daily digest queue
+        await _queue_for_digest(
+            project_id=project_id,
+            ref=f"mr:{mr_iid}",
+            developer=gitlab_username,
+            findings=findings,
+        )
 
     # Step 6 – persist MR analysis
     mrs_col = database.get_collection("merge_requests")
@@ -654,7 +764,6 @@ async def run_scheduled_scan(project_id: int) -> dict:
             # Send a weekly coaching report if one hasn't been sent this week
             username = profile.get("gitlab_username") or ""
             if username:
-                from datetime import timedelta
                 one_week_ago = datetime.now(timezone.utc) - timedelta(days=7)
                 recent_report = await ghost_actions_col.find_one(
                     {

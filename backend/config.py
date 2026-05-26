@@ -21,5 +21,8 @@ class Settings(BaseSettings):
     google_cloud_project: str = ""
     vertex_ai_location: str = "us-central1"
 
+    pubsub_topic: str = "ghost-engineer-events"
+    pubsub_subscription: str = "ghost-engineer-sub"
+
 
 settings = Settings()
