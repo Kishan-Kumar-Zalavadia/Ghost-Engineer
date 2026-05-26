@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -406,6 +407,64 @@ Do NOT say you are an AI. Under 400 words total.
 # ---------------------------------------------------------------------------
 # Function 3 — Generate developer coaching report
 # ---------------------------------------------------------------------------
+
+async def generate_code_fix(
+    task: str,
+    original_code: str,
+    context: str = "",
+    language: str = "python",
+) -> str:
+    """
+    Ask Gemini to make a targeted code improvement and return only the fixed code.
+
+    Used by the proactive scanner for:
+    - Extracting duplicate functions into shared utilities
+    - Replacing hardcoded secrets with os.environ references
+    - Adding docstrings to undocumented public functions
+
+    The response is stripped of any markdown fences before returning so the
+    output can be written directly to a file.
+
+    Parameters
+    ----------
+    task:
+        Clear description of what needs to be changed and why.
+    original_code:
+        The full current file content (or relevant excerpt).
+    context:
+        Optional extra context (e.g. what other files import this one).
+    language:
+        Target language for syntax hints — default ``"python"``.
+
+    Returns
+    -------
+    str  The improved code, ready to write to a file.
+    """
+    context_block = f"\nCONTEXT:\n{context}\n" if context else ""
+    prompt = f"""\
+You are a senior software engineer making a targeted, minimal code improvement.
+
+TASK: {task}
+
+LANGUAGE: {language}
+{context_block}
+ORIGINAL CODE:
+{original_code[:7000]}
+
+Rules:
+- Return ONLY the complete improved file content. No explanation.
+- No markdown code fences (no ```python or ``` wrappers).
+- Preserve all existing logic, imports, and comments exactly.
+- Make only the changes described in the task — nothing else.
+- The output will be written directly to a source file and must be \
+valid, complete, runnable {language}.
+"""
+    raw = await _call_gemini(prompt, temperature=0.25)
+    # Strip any accidental markdown fences Gemini might include
+    raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.MULTILINE)
+    raw = re.sub(r"\n?```$", "", raw.strip(), flags=re.MULTILINE)
+    return raw.strip()
+
 
 async def generate_developer_coaching_report(
     developer_profile: dict,
